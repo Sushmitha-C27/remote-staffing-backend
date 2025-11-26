@@ -1,0 +1,31 @@
+name: Build Snowflake Lambda Layer
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-layer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pull AWS SAM Python 3.11 build image
+        run: docker pull public.ecr.aws/sam/build-python3.11:latest
+
+      - name: Build Layer
+        run: |
+          mkdir -p layer/python
+          docker run --rm -v "$PWD/layer/python":/out public.ecr.aws/sam/build-python3.11:latest \
+            /bin/bash -lc "pip install --no-cache-dir snowflake-connector-python -t /out"
+
+      - name: Zip layer
+        run: |
+          cd layer
+          zip -r ../snowflake_layer.zip python
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: snowflake_layer
+          path: snowflake_layer.zip
