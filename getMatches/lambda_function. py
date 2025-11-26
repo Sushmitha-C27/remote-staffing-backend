@@ -1,7 +1,77 @@
+# getMatches/lambda_function.py
+import os
 import json
+import traceback
+import boto3
+import snowflake.connector
+
+SSM_PREFIX = os.environ.get("SSM_PREFIX", "/remote-staffing/snowflake")
+REGION = os.environ.get("AWS_REGION", "eu-north-1")
+ssm = boto3.client("ssm", region_name=REGION)
+
+def get_param(name):
+    key = f"{SSM_PREFIX}/{name}"
+    resp = ssm.get_parameter(Name=key, WithDecryption=True)
+    return resp["Parameter"]["Value"].strip()
+
+def get_sf_conn():
+    return snowflake.connector.connect(
+        user=get_param("user"),
+        password=get_param("password"),
+        account=get_param("account"),
+        role=get_param("role"),
+        warehouse=get_param("warehouse"),
+        database=get_param("database"),
+        schema=get_param("schema"),
+    )
+
+def table_exists(cur, db, schema, table):
+    cur.execute(
+        "SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_CATALOG=%s AND TABLE_SCHEMA=%s AND TABLE_NAME=%s",
+        (db, schema, table)
+    )
+    return cur.fetchone() is not None
 
 def lambda_handler(event, context):
-    return {
-        "statusCode": 200,
-        "body": json.dumps({"message": "getMatches running - logic not implemented yet"})
-    }
+    try:
+        raw = event.get("body","{}")
+        body = json.loads(raw)
+        job_id = body.get("job_id")
+        top_k = int(body.get("top_k", 5))
+
+        if not job_id:
+            return {"statusCode": 400, "body": "Missing job_id"}
+
+        conn = get_sf_conn()
+        cur = conn.cursor()
+        db = get_param("database")
+        schema = get_param("schema")
+
+        if table_exists(cur, db, schema, "MATCH_SCORES"):
+            sql = f"""
+            SELECT CANDIDATE_ID, SCORE
+            FROM {db}.{schema}.MATCH_SCORES
+            WHERE JOB_ID = %s
+            ORDER BY SCORE DESC
+            LIMIT %s
+            """
+            cur.execute(sql, (job_id, top_k))
+            rows = cur.fetchall()
+            matches = [{"candidate_id": r[0], "score": float(r[1])} for r in rows]
+            cur.close()
+            conn.close()
+            return {"statusCode": 200, "body": json.dumps({"matches": matches})}
+        else:
+            # No precomputed table — inform next steps
+            cur.close()
+            conn.close()
+            return {
+                "statusCode": 501,
+                "body": json.dumps({
+                    "message": "MATCH_SCORES table not found. Please populate MATCH_SCORES (job_id, candidate_id, score) or provide embeddings and I will give an alternate getMatches implementation using embeddings."
+                })
+            }
+
+    except Exception as e:
+        traceback.print_exc()
+        return {"statusCode":500, "body": f"Error: {str(e)}"}
