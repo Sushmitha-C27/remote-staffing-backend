@@ -1,103 +1,109 @@
-# uploadCandidate/lambda_function.py
-import os
 import json
-import traceback
+import uuid
+import logging
+from datetime import datetime
+from typing import Dict, Any
+
 import boto3
-import snowflake.connector
 
-# SSM prefix & region
-SSM_PREFIX = os.environ.get("SSM_PREFIX", "/remote-staffing/snowflake")
-REGION = os.environ.get("AWS_REGION", "eu-north-1")  # change if your SSM is in different region
-ssm = boto3.client("ssm", region_name=REGION)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-def get_param(name: str) -> str:
-    key = f"{SSM_PREFIX}/{name}"
-    resp = ssm.get_parameter(Name=key, WithDecryption=True)
-    return resp["Parameter"]["Value"].strip()
+# AWS clients
+dynamodb = boto3.resource("dynamodb")
+events = boto3.client("events")
 
-def get_sf_conn():
-    # read credentials from SSM (account, user, password, role, warehouse, database, schema)
-    account = get_param("account")
-    user = get_param("user")
-    password = get_param("password")
-    role = get_param("role")
-    warehouse = get_param("warehouse")
-    database = get_param("database")
-    schema = get_param("schema")
-    conn = snowflake.connector.connect(
-        user=user,
-        password=password,
-        account=account,
-        role=role,
-        warehouse=warehouse,
-        database=database,
-        schema=schema
-    )
-    return conn
+# ENV
+CANDIDATES_TABLE = "Candidates"
+EVENT_BUS = "default"
+CORS_ORIGIN = "*"
 
-# candidate column candidates (uppercase)
-NAME_CANDIDATES = ["NAME", "FULL_NAME", "CANDIDATE_NAME", "FIRST_NAME"]
-EMAIL_CANDIDATES = ["EMAIL", "EMAIL_ADDRESS", "CONTACT_EMAIL"]
-RESUME_CANDIDATES = ["RESUME_TEXT", "RESUME", "CV_TEXT", "SUMMARY", "RESUME_CONTENT"]
+table = dynamodb.Table(CANDIDATES_TABLE)
 
-def list_columns(cur, db, schema, table):
-    cur.execute(
-        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_CATALOG=%s AND TABLE_SCHEMA=%s AND TABLE_NAME=%s ORDER BY ORDINAL_POSITION",
-        (db, schema, table)
-    )
-    return [r[0].upper() for r in cur.fetchall()]
+# ---------- helpers ----------
 
-def choose_column(cols, candidates):
-    cols_set = set(cols)
-    for c in candidates:
-        if c in cols_set:
-            return c
-    # try substring matches (if candidate is part of column name)
-    for col in cols:
-        for c in candidates:
-            if c in col:
-                return col
-    return None
+def build_response(status: int, body: Any) -> Dict:
+    return {
+        "statusCode": status,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": CORS_ORIGIN,
+            "Access-Control-Allow-Headers": "Content-Type",
+            "Access-Control-Allow-Methods": "OPTIONS,POST"
+        },
+        "body": json.dumps(body)
+    }
 
-def upload_candidate_handler(event, context):
+def parse_body(event: Dict) -> Dict:
+    body = event.get("body", {})
+    if isinstance(body, str):
+        return json.loads(body)
+    return body
+
+# ---------- handler ----------
+
+def lambda_handler(event, context):
+    logger.info("POST /candidates invoked")
+
+    if event.get("httpMethod") == "OPTIONS":
+        return build_response(200, {"ok": True})
+
     try:
-        raw_body = event.get("body", "{}")
-        body = json.loads(raw_body) if isinstance(raw_body, str) else raw_body
+        payload = parse_body(event)
 
-        name = body.get("name")
-        email = body.get("email")
-        resume_text = body.get("resume_text")
+        full_name = payload.get("name")
+        email = payload.get("email")
+        resume_text = payload.get("resume_text")
 
-        if not (name and email and resume_text):
-            return {"statusCode": 400, "body": "Missing name, email or resume_text"}
+        # 🔹 NEW: requested_role from frontend
+        requested_role = payload.get("requested_role", "candidate")
 
-        conn = get_sf_conn()
-        cur = conn.cursor()
-        db = get_param("database")
-        schema = get_param("schema")
-        table = "CANDIDATE_DATA_CLEANED"
+        if not all([full_name, email, resume_text]):
+            return build_response(400, {
+                "error": "name, email, resume_text are required"
+            })
 
-        cols = list_columns(cur, db, schema, table)
-        if not cols:
-            return {"statusCode": 500, "body": f"Could not list columns for {db}.{schema}.{table}"}
+        # 🔒 Validate requested_role (intent only)
+        if requested_role not in ["candidate", "recruiter", "admin"]:
+            requested_role = "candidate"
 
-        name_col = choose_column(cols, NAME_CANDIDATES)
-        email_col = choose_column(cols, EMAIL_CANDIDATES)
-        resume_col = choose_column(cols, RESUME_CANDIDATES)
+        candidate_id = str(uuid.uuid4())
+        created_at = datetime.utcnow().isoformat()
 
-        if not (name_col and email_col and resume_col):
-            return {"statusCode": 500, "body": f"Could not map candidate columns. Found: {cols}"}
+        # ✅ Store candidate in DynamoDB
+        table.put_item(
+            Item={
+                "candidate_id": candidate_id,
+                "full_name": full_name,
+                "email": email,
+                "resume_text": resume_text,
+                "source": "upload",
+                "created_at": created_at,
 
-        # Use quoted identifiers to preserve exact column names/case
-        insert_sql = f'INSERT INTO {db}.{schema}.{table} ("{name_col}", "{email_col}", "{resume_col}") VALUES (%s, %s, %s)'
+                # 🔐 AUTHORITY (backend-controlled)
+                "role": "candidate",
 
-        cur.execute(insert_sql, (name, email, resume_text))
-        conn.commit()
-        cur.close()
-        conn.close()
+                # 🧠 INTENT (frontend-controlled)
+                "requested_role": requested_role
+            }
+        )
 
-        return {"statusCode": 200, "body": json.dumps({"message": "Candidate uploaded", "columns": [name_col, email_col, resume_col]})}
+        # ✅ Emit EventBridge event (for ML scoring later)
+        events.put_events(Entries=[{
+            "Source": "remote-staffing.candidates",
+            "DetailType": "CandidateUploaded",
+            "EventBusName": EVENT_BUS,
+            "Detail": json.dumps({
+                "candidate_id": candidate_id
+            })
+        }])
+
+        return build_response(200, {
+            "message": "Candidate uploaded successfully",
+            "candidate_id": candidate_id,
+            "requested_role": requested_role
+        })
 
     except Exception as e:
-        traceback.print_exc()
-        return {"statusCode": 500, "body": f"Error: {str(e)}"}
+        logger.exception("Upload candidate failed")
+        return build_response(500, {"error": str(e)})
