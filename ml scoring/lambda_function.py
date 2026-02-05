@@ -12,7 +12,6 @@ logger.setLevel(logging.INFO)
 S3 = boto3.client("s3")
 SECRETS = boto3.client("secretsmanager")
 
-# ---------------- CONFIG ----------------
 ML_S3_BUCKET = os.environ.get("ML_S3_BUCKET", "remote-staffing-ml")
 ML_S3_PREFIX = os.environ.get("ML_S3_PREFIX", "artifacts/")
 JOB_EMB_CSV_KEY = os.environ.get(
@@ -27,7 +26,6 @@ SF_SECRET_ARN = os.environ.get("SF_SECRET_ARN")
 SF_DATABASE = os.environ.get("SF_DATABASE", "JOB_PORTAL_DB")
 SF_SCHEMA = os.environ.get("SF_SCHEMA", "CLEAN")
 
-# ---------------- COSINE SIMILARITY ----------------
 def dot(a, b):
     return sum(x * y for x, y in zip(a, b))
 
@@ -40,7 +38,6 @@ def cosine(a, b):
         return 0.0
     return dot(a, b) / (na * nb)
 
-# ---------------- LOAD JOB EMBEDDINGS ----------------
 def download_s3_to_tmp(key):
     tmp = tempfile.mktemp()
     logger.info("Downloading embeddings from s3://%s/%s", ML_S3_BUCKET, key)
@@ -61,7 +58,6 @@ def load_job_embeddings():
     logger.info("Loaded %d job embeddings", len(rows))
     return rows
 
-# ---------------- SNOWFLAKE CONNECTION ----------------
 def get_snowflake_conn():
     import snowflake.connector
 
@@ -77,7 +73,6 @@ def get_snowflake_conn():
         schema=cred.get("SF_SCHEMA", SF_SCHEMA),
     )
 
-# ---------------- WRITE MATCH SCORES ----------------
 def persist_scores(candidate_id, matches):
     conn = get_snowflake_conn()
     cur = conn.cursor()
@@ -108,7 +103,6 @@ def persist_scores(candidate_id, matches):
     logger.info("Snowflake write complete")
 
 
-# ---------------- MAIN HANDLER ----------------
 def lambda_handler(event, context):
     logger.info("ml-scoring-lambda invoked")
 
@@ -118,7 +112,6 @@ def lambda_handler(event, context):
     if not candidate_id:
         return {"status": "error", "message": "candidate_id missing"}
 
-    # ---------- Fetch resume text ----------
     conn = get_snowflake_conn()
     cur = conn.cursor()
     cur.execute(
@@ -134,16 +127,13 @@ def lambda_handler(event, context):
 
     resume_text = row[0]
 
-    # ---------- Load job embeddings ----------
     job_embs = load_job_embeddings()
     if not job_embs:
         return {"status": "error", "message": "no job embeddings found"}
 
-    # ---------- Dimension-safe resume embedding ----------
     embedding_dim = len(job_embs[0][1])
     resume_emb = [len(resume_text)] * embedding_dim
 
-    # ---------- Compute similarities ----------
     raw_scores = []
     for job_id, job_emb in job_embs:
         score = cosine(resume_emb, job_emb)
@@ -152,7 +142,6 @@ def lambda_handler(event, context):
     if not raw_scores:
         return {"status": "error", "message": "no matches computed"}
 
-    # ---------- Normalize scores to 0–100 ----------
     max_score = max(s for _, s in raw_scores) or 1.0
     normalized = [
         (job_id, round((score / max_score) * 100, 2))
@@ -162,7 +151,6 @@ def lambda_handler(event, context):
     normalized.sort(key=lambda x: x[1], reverse=True)
     top_matches = normalized[:TOP_N]
 
-    # ---------- Persist ----------
     persist_scores(candidate_id, top_matches)
 
     return {
