@@ -6,15 +6,11 @@ import hashlib
 from datetime import datetime
 from decimal import Decimal
 
-# =====================================================
-# AWS
-# =====================================================
+
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table("JobDescriptions")
 
-# =====================================================
-# ENV
-# =====================================================
+
 ADZUNA_APP_ID = os.environ["ADZUNA_APP_ID"]
 ADZUNA_APP_KEY = os.environ["ADZUNA_APP_KEY"]
 ADZUNA_COUNTRIES = os.environ.get(
@@ -24,15 +20,13 @@ ADZUNA_COUNTRIES = os.environ.get(
 
 JOOBLE_API_KEY = os.environ["JOOBLE_API_KEY"]
 
-# =====================================================
-# HELPERS
-# =====================================================
+
 def sha_job_id(source, title, company, city, country):
     raw = f"{source}|{title}|{company}|{city}|{country}".lower()
     return hashlib.sha256(raw.encode()).hexdigest()
 
 def normalize_apply_url(job):
-    # Priority: direct apply → employer site → provider landing
+    
     return (
         job.get("apply_url")
         or job.get("redirect_url")
@@ -57,9 +51,7 @@ def compute_quality(apply_url, salary_min, salary_max, company, city):
         score += 10
     return score
 
-# =====================================================
-# ADZUNA INGESTION
-# =====================================================
+
 def fetch_adzuna(query):
     jobs = []
 
@@ -98,9 +90,6 @@ def fetch_adzuna(query):
     return jobs
 
 
-# =====================================================
-# LAMBDA HANDLER
-# =====================================================
 def lambda_handler(event, context):
     query = event.get("query", "software engineer")
 
